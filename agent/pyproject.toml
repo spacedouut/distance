@@ -1,0 +1,7 @@
+[project]
+name = "distance-agent"
+version = "0.1.0"
+description = "Distance web agent for forwariding content to the web client & codec management"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []

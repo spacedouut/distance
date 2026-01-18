@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distance</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0a0a;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        #container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100vw;
+            height: 100vh;
+            background: #1a1a1a;
+        }
+
+        #screen {
+            max-width: 90vw;
+            max-height: 90vh;
+            border: 2px solid #333;
+            background: #000;
+        }
+
+        #status {
+            position: fixed;
+            top: 15px;
+            left: 15px;
+            background: rgba(0, 0, 0, 0.85);
+            color: #0f0;
+            padding: 12px 16px;
+            font-size: 12px;
+            border: 1px solid #333;
+            border-radius: 4px;
+            line-height: 1.6;
+        }
+
+        #stats {
+            position: fixed;
+            bottom: 15px;
+            left: 15px;
+            background: rgba(0, 0, 0, 0.85);
+            color: #0f0;
+            padding: 12px 16px;
+            font-size: 11px;
+            border: 1px solid #333;
+            border-radius: 4px;
+            line-height: 1.5;
+        }
+
+        .status-line {
+            display: flex;
+            justify-content: space-between;
+            gap: 20px;
+        }
+
+        .success { color: #0f0; }
+        .error { color: #f00; }
+        .warning { color: #ff0; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <canvas id="screen"></canvas>
+    </div>
+
+    <div id="status">
+        <div class="status-line">
+            <span>Status:</span>
+            <span id="connectionStatus" class="warning">Connecting...</span>
+        </div>
+        <div class="status-line">
+            <span>Resolution:</span>
+            <span id="resolution">-</span>
+        </div>
+        <div class="status-line">
+            <span>FPS:</span>
+            <span id="fps">0</span>
+        </div>
+    </div>
+
+    <div id="stats">
+        <div>Frame: <span id="frameSize">-</span> KB</div>
+        <div>Network: <span id="networkStats">-</span> Mbps</div>
+    </div>
+
+    <script>
+        const MSG_TYPE = {
+            METADATA: 0x01,
+            FRAME: 0x02,
+            SETTINGS: 0x10,
+        };
+
+        class DistanceClient {
+            constructor() {
+                this.canvas = document.getElementById('screen');
+                this.ctx = this.canvas.getContext('2d');
+                this.socket = null;
+
+                this.buffer = new Uint8Array(0);
+                this.frameCount = 0;
+                this.lastStatsTime = Date.now();
+                this.bytesReceived = 0;
+
+                this.metadata = {
+                    width: 0,
+                    height: 0,
+                    fps: 30,
+                    quality: 75,
+                };
+
+                this.setup();
+            }
+
+            setup() {
+                // Input handlers (stub for now)
+                document.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+                document.addEventListener('keydown', (e) => this.handleKeyDown(e));
+
+                this.connect();
+            }
+
+            connect() {
+                this.socket = new WebSocket('ws://localhost:8080');
+                this.socket.binaryType = 'arraybuffer';
+
+                this.socket.onopen = () => this.onOpen();
+                this.socket.onmessage = (e) => this.onMessage(e);
+                this.socket.onerror = () => this.onError();
+                this.socket.onclose = () => this.onClose();
+            }
+
+            onOpen() {
+                this.updateStatus('Connected', 'success');
+                console.log('[CLIENT] Connected');
+            }
+
+            onMessage(event) {
+                const data = new Uint8Array(event.data);
+                this.bytesReceived += data.length;
+
+                // Append to buffer
+                const newBuffer = new Uint8Array(this.buffer.length + data.length);
+                newBuffer.set(this.buffer);
+                newBuffer.set(data, this.buffer.length);
+                this.buffer = newBuffer;
+
+                this.processBuffer();
+            }
+
+            processBuffer() {
+                while (this.buffer.length >= 1) {
+                    const msgType = this.buffer[0];
+
+                    if (msgType === MSG_TYPE.METADATA) {
+                        if (this.buffer.length >= 13) {
+                            const view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
+                            this.metadata.width = view.getUint16(1, false);
+                            this.metadata.height = view.getUint16(3, false);
+                            this.metadata.fps = view.getUint32(5, false);
+                            this.metadata.quality = view.getUint32(9, false);
+
+                            console.log('[METADATA]', this.metadata);
+                            document.getElementById('resolution').textContent = 
+                                `${this.metadata.width}x${this.metadata.height}`;
+
+                            this.canvas.width = this.metadata.width;
+                            this.canvas.height = this.metadata.height;
+
+                            this.buffer = this.buffer.slice(13);
+                        } else {
+                            break;
+                        }
+                    } else if (msgType === MSG_TYPE.FRAME) {
+                        if (this.buffer.length >= 5) {
+                            const view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
+                            const frameSize = view.getUint32(1, false);
+                            const totalSize = 5 + frameSize;
+
+                            if (this.buffer.length >= totalSize) {
+                                const frameData = this.buffer.slice(5, totalSize);
+                                this.buffer = this.buffer.slice(totalSize);
+                                this.renderFrame(frameData);
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    } else {
+                        console.warn(`[BUFFER] Unknown type: 0x${msgType.toString(16)}`);
+                        this.buffer = this.buffer.slice(1);
+                    }
+                }
+            }
+
+            renderFrame(frameData) {
+                try {
+                    const blob = new Blob([frameData], { type: 'image/jpeg' });
+                    const url = URL.createObjectURL(blob);
+                    const img = new Image();
+
+                    img.onload = () => {
+                        this.ctx.drawImage(img, 0, 0);
+                        URL.revokeObjectURL(url);
+
+                        this.frameCount++;
+                        const now = Date.now();
+                        const elapsed = (now - this.lastStatsTime) / 1000;
+
+                        if (elapsed >= 1.0) {
+                            const fps = Math.round(this.frameCount / elapsed);
+                            const mbps = (this.bytesReceived * 8) / (elapsed * 1_000_000);
+
+                            document.getElementById('fps').textContent = fps;
+                            document.getElementById('frameSize').textContent = 
+                                (frameData.length / 1024).toFixed(1);
+                            document.getElementById('networkStats').textContent = mbps.toFixed(2);
+
+                            this.frameCount = 0;
+                            this.bytesReceived = 0;
+                            this.lastStatsTime = now;
+                        }
+                    };
+
+                    img.onerror = () => {
+                        console.error('[FRAME] Invalid JPEG');
+                        URL.revokeObjectURL(url);
+                    };
+
+                    img.src = url;
+                } catch (e) {
+                    console.error('[RENDER]', e);
+                }
+            }
+
+            handleMouseMove(e) {
+                if (this.socket?.readyState !== WebSocket.OPEN) return;
+                // TODO: Send mouse position to agent
+            }
+
+            handleKeyDown(e) {
+                if (this.socket?.readyState !== WebSocket.OPEN) return;
+                // TODO: Send key event to agent
+            }
+
+            sendSettings(quality, width = null, height = null) {
+                if (this.socket?.readyState !== WebSocket.OPEN) return;
+
+                let flags = 0;
+                let msg;
+
+                if (width && height) {
+                    flags |= 0x01;  // Resolution change flag
+                    msg = new Uint8Array(8);
+                    msg[0] = MSG_TYPE.SETTINGS;
+                    new DataView(msg.buffer).setUint16(1, quality, false);
+                    msg[3] = flags;
+                    new DataView(msg.buffer).setUint16(4, width, false);
+                    new DataView(msg.buffer).setUint16(6, height, false);
+                } else {
+                    msg = new Uint8Array(4);
+                    msg[0] = MSG_TYPE.SETTINGS;
+                    new DataView(msg.buffer).setUint16(1, quality, false);
+                    msg[3] = flags;
+                }
+
+                this.socket.send(msg);
+            }
+
+            onError() {
+                this.updateStatus('Error', 'error');
+                console.error('[ERROR] Connection failed');
+            }
+
+            onClose() {
+                this.updateStatus('Disconnected', 'error');
+                console.log('[CLIENT] Disconnected');
+                setTimeout(() => this.connect(), 2000);
+            }
+
+            updateStatus(text, className) {
+                const el = document.getElementById('connectionStatus');
+                el.textContent = text;
+                el.className = className;
+            }
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            new DistanceClient();
+        });
+    </script>
+</body>
+</html>
