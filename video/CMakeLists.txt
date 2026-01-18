@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(distance_video C)
+project(distance_encoder C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -21,23 +21,33 @@ if(NOT TURBOJPEG_FOUND)
     endif()
 endif()
 
-
-
-# Main executable
-add_executable(distance_video src/main.c)
-
-target_link_libraries(distance_video
-    PRIVATE
-    ${TURBOJPEG_LIBRARY}
-)
-
-if(WIN32)
-    target_link_libraries(distance_video PRIVATE gdi32 user32)
+# cJSON is header-only, add to include path
+set(CJSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/cJSON")
+if(NOT EXISTS "${CJSON_DIR}")
+    message(FATAL_ERROR "cJSON not found. Download from https://github.com/DaveGamble/cJSON")
 endif()
 
+# Main executable
+add_executable(distance_encoder
+    src/main.c
+    src/config.c
+    src/shared_memory.c
+    src/capture.c
+    src/capture/gdi.c
+)
+
 # Include directories
-target_include_directories(distance_video
+target_include_directories(distance_encoder
     PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/deps
     ${TURBOJPEG_INCLUDE_DIR}
+)
+
+# Link libraries
+target_link_libraries(distance_encoder
+    PRIVATE
+    ${TURBOJPEG_LIBRARY}
+    gdi32
+    user32
 )
