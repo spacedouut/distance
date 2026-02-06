@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
-project(distance_encoder C)
+project(distance_encoder CXX)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find TurboJPEG
 find_package(PkgConfig QUIET)
@@ -13,7 +13,7 @@ endif()
 if(NOT TURBOJPEG_FOUND)
     find_library(TURBOJPEG_LIBRARY turbojpeg)
     find_path(TURBOJPEG_INCLUDE_DIR turbojpeg.h)
-    
+
     if(TURBOJPEG_LIBRARY AND TURBOJPEG_INCLUDE_DIR)
         set(TURBOJPEG_FOUND TRUE)
     else()
@@ -29,11 +29,12 @@ endif()
 
 # Main executable
 add_executable(distance_encoder
-    src/main.c
-    src/config.c
-    src/shared_memory.c
-    src/capture.c
-    src/capture/gdi.c
+    src/main.cpp
+    src/config.cpp
+    src/shared_memory.cpp
+    src/capture.cpp
+    src/capture/gdi.cpp
+    src/capture/dxgi.cpp
 )
 
 # Include directories
@@ -48,6 +49,8 @@ target_include_directories(distance_encoder
 target_link_libraries(distance_encoder
     PRIVATE
     ${TURBOJPEG_LIBRARY}
+    d3d11
+    dxgi
     gdi32
     user32
 )
