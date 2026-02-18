@@ -2,6 +2,8 @@
 #include <cstring>
 #include "shared_memory.hpp"
 
+#ifdef _WIN32
+
 SharedMemory::SharedMemory(const std::string &name, int size) : size(size), name(name) {
     if (name.empty() || size <= 0) {
         return;
@@ -116,3 +118,5 @@ uint32_t SharedMemory::get_sequence() const {
     }
     return buffer->sequence;
 }
+
+#endif // _WIN32

@@ -76,6 +76,9 @@
         <canvas id="screen"></canvas>
     </div>
 
+    <!-- Hidden video element used by MSE path -->
+    <video id="mseVideo" style="display:none" autoplay muted playsinline></video>
+
     <div id="status">
         <div class="status-line">
             <span>Status:</span>
@@ -89,6 +92,10 @@
             <span>FPS:</span>
             <span id="fps">0</span>
         </div>
+        <div class="status-line">
+            <span>Codec:</span>
+            <span id="codecInfo">-</span>
+        </div>
     </div>
 
     <div id="stats">
@@ -98,48 +105,342 @@
 
     <script>
         const MSG_TYPE = {
-            METADATA: 0x01,
-            FRAME: 0x02,
-            SETTINGS: 0x10,
+            METADATA:    0x01,
+            FRAME:       0x02,  // legacy JPEG mock
+            VIDEO_INIT:  0x03,  // H.264 init (SPS/PPS)
+            VIDEO_FRAME: 0x04,  // H.264 frame (Annex B)
+            SETTINGS:    0x10,
         };
+
+        // ---------------------------------------------------------------------------
+        // AVCDecoderConfigurationRecord builder
+        // sps / pps are Uint8Array WITHOUT startcodes
+        // ---------------------------------------------------------------------------
+        function buildAVCDecoderConfig(sps, pps) {
+            const len = 7 + sps.length + 3 + pps.length;
+            const buf = new Uint8Array(len);
+            let i = 0;
+            buf[i++] = 1;                       // configurationVersion
+            buf[i++] = sps[1];                  // AVCProfileIndication
+            buf[i++] = sps[2];                  // profile_compatibility
+            buf[i++] = sps[3];                  // AVCLevelIndication
+            buf[i++] = 0xFF;                    // lengthSizeMinusOne = 3 → 4-byte NAL lengths
+            buf[i++] = 0xE1;                    // numSequenceParameterSets = 1
+            buf[i++] = (sps.length >> 8) & 0xFF;
+            buf[i++] = sps.length & 0xFF;
+            buf.set(sps, i); i += sps.length;
+            buf[i++] = 0x01;                    // numPictureParameterSets = 1
+            buf[i++] = (pps.length >> 8) & 0xFF;
+            buf[i++] = pps.length & 0xFF;
+            buf.set(pps, i);
+            return buf;
+        }
+
+        // e.g. "avc1.42001f"
+        function codecStringFromSPS(sps) {
+            const hex = n => n.toString(16).padStart(2, '0');
+            return `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Minimal fMP4 box builder (MSE path — Firefox)
+        // ---------------------------------------------------------------------------
+
+        function writeUint32BE(buf, offset, val) {
+            buf[offset]   = (val >>> 24) & 0xFF;
+            buf[offset+1] = (val >>> 16) & 0xFF;
+            buf[offset+2] = (val >>> 8)  & 0xFF;
+            buf[offset+3] =  val         & 0xFF;
+        }
+
+        function makeBox(type4cc, ...children) {
+            const typeBytes = new TextEncoder().encode(type4cc);
+            const inner = children.reduce((acc, c) => {
+                const tmp = new Uint8Array(acc.length + c.length);
+                tmp.set(acc); tmp.set(c, acc.length);
+                return tmp;
+            }, new Uint8Array(0));
+            const box = new Uint8Array(8 + inner.length);
+            writeUint32BE(box, 0, box.length);
+            box.set(typeBytes, 4);
+            box.set(inner, 8);
+            return box;
+        }
+
+        function u32BE(v) {
+            const b = new Uint8Array(4);
+            writeUint32BE(b, 0, v >>> 0);
+            return b;
+        }
+        function u16BE(v) {
+            return new Uint8Array([(v >> 8) & 0xFF, v & 0xFF]);
+        }
+        function u8(v) { return new Uint8Array([v & 0xFF]); }
+        function bytes(...args) {
+            const flat = args.flat(Infinity);
+            return new Uint8Array(flat);
+        }
+
+        function buildFtypBox() {
+            // ftyp: major=isom, minor=0, compatible=[isom, iso5, avc1, dash]
+            const enc = s => new TextEncoder().encode(s);
+            return makeBox('ftyp',
+                enc('isom'),
+                u32BE(0),
+                enc('isom'), enc('iso5'), enc('avc1'), enc('dash')
+            );
+        }
+
+        function buildMoovBox(width, height, sps, pps) {
+            const avcc = buildAVCDecoderConfig(sps, pps);
+
+            // avcC box
+            const avcCBox = makeBox('avcC', avcc);
+
+            // avc1 visual sample entry
+            const avc1Inner = bytes(
+                new Uint8Array(6),              // reserved
+                u16BE(1),                       // data-reference-index = 1
+                new Uint8Array(16),             // pre-defined / reserved
+                u16BE(width), u16BE(height),    // width, height
+                // horiz/vert resolution 72dpi
+                new Uint8Array([0,72,0,0, 0,72,0,0]),
+                new Uint8Array(4),              // reserved
+                u16BE(1),                       // frame_count
+                new Uint8Array(32),             // compressorname (empty)
+                u16BE(0x0018),                  // depth = 24
+                new Uint8Array([0xFF, 0xFF])    // pre_defined = -1
+            );
+            const avc1Box = makeBox('avc1', avc1Inner, avcCBox);
+
+            // stsd
+            const stsdBox = makeBox('stsd',
+                u32BE(0),   // version + flags
+                u32BE(1),   // entry count
+                avc1Box
+            );
+
+            // stts, stsc, stsz, stco — all empty (fragmented MP4, no samples in moov)
+            const sttsBox = makeBox('stts', u32BE(0), u32BE(0));
+            const stscBox = makeBox('stsc', u32BE(0), u32BE(0));
+            const stszBox = makeBox('stsz', u32BE(0), u32BE(0), u32BE(0));
+            const stcoBox = makeBox('stco', u32BE(0), u32BE(0));
+            const stblBox = makeBox('stbl', stsdBox, sttsBox, stscBox, stszBox, stcoBox);
+
+            // url (dref entry)
+            const urlBox = makeBox('url ', u32BE(1)); // flags=1 → self-contained
+            const drefBox = makeBox('dref', u32BE(0), u32BE(1), urlBox);
+            const dinfBox = makeBox('dinf', drefBox);
+
+            // vmhd
+            const vmhdBox = makeBox('vmhd', u32BE(1), u32BE(0));
+
+            // minf
+            const minfBox = makeBox('minf', vmhdBox, dinfBox, stblBox);
+
+            // mdhd — timescale 90000 (common for video), duration 0
+            const mdhdBox = makeBox('mdhd',
+                u32BE(0),       // version + flags
+                u32BE(0),       // creation_time
+                u32BE(0),       // modification_time
+                u32BE(90000),   // timescale
+                u32BE(0),       // duration
+                u16BE(0x55C4),  // language = 'und' packed
+                u16BE(0)        // pre_defined
+            );
+
+            // hdlr
+            const hdlrBox = makeBox('hdlr',
+                u32BE(0),
+                u32BE(0),
+                new TextEncoder().encode('vide'),
+                u32BE(0), u32BE(0), u32BE(0),
+                new TextEncoder().encode('VideoHandler\0')
+            );
+
+            // mdia
+            const mdiaBox = makeBox('mdia', mdhdBox, hdlrBox, minfBox);
+
+            // tkhd — track enabled, in movie, in preview
+            const tkhdBox = makeBox('tkhd',
+                u32BE(0x0000000F),  // version=0, flags=0xF (enabled|in_movie|in_preview|size_is_aspect_ratio)
+                u32BE(0),           // creation_time
+                u32BE(0),           // modification_time
+                u32BE(1),           // track_id
+                u32BE(0),           // reserved
+                u32BE(0),           // duration
+                u32BE(0), u32BE(0), // reserved
+                u16BE(0),           // layer
+                u16BE(0),           // alternate_group
+                u16BE(0),           // volume (0 for video)
+                u16BE(0),           // reserved
+                // identity matrix
+                u32BE(0x00010000), u32BE(0), u32BE(0),
+                u32BE(0), u32BE(0x00010000), u32BE(0),
+                u32BE(0), u32BE(0), u32BE(0x40000000),
+                u32BE(width  << 16),  // width (16.16 fixed)
+                u32BE(height << 16)   // height (16.16 fixed)
+            );
+
+            // trak
+            const trakBox = makeBox('trak', tkhdBox, mdiaBox);
+
+            // mvhd — timescale 1000, duration 0
+            const mvhdBox = makeBox('mvhd',
+                u32BE(0),       // version + flags
+                u32BE(0),       // creation_time
+                u32BE(0),       // modification_time
+                u32BE(1000),    // timescale
+                u32BE(0),       // duration
+                u32BE(0x00010000), // rate = 1.0
+                u16BE(0x0100),  // volume = 1.0
+                u16BE(0),       // reserved
+                u32BE(0), u32BE(0), // reserved
+                // identity matrix
+                u32BE(0x00010000), u32BE(0), u32BE(0),
+                u32BE(0), u32BE(0x00010000), u32BE(0),
+                u32BE(0), u32BE(0), u32BE(0x40000000),
+                new Uint8Array(24), // pre-defined
+                u32BE(2)        // next_track_id
+            );
+
+            // mvex with trex
+            const trexBox = makeBox('trex',
+                u32BE(0),   // version + flags
+                u32BE(1),   // track_id
+                u32BE(1),   // default_sample_description_index
+                u32BE(0),   // default_sample_duration
+                u32BE(0),   // default_sample_size
+                u32BE(0)    // default_sample_flags
+            );
+            const mvexBox = makeBox('mvex', trexBox);
+
+            return makeBox('moov', mvhdBox, trakBox, mvexBox);
+        }
+
+        // Build moof + mdat for one frame
+        // duration in 90kHz ticks (e.g. 3000 = 1/30 s)
+        let _mseSeqNum = 1;
+        let _mseDts = 0;
+
+        function buildFragmentBoxes(frameData, isKey, durationTicks) {
+            const dataSize = frameData.length;
+
+            // trun sample flags
+            // non-sync: 0x01010000, sync: 0x02000000 (depends on decoder)
+            const sampleFlags = isKey ? 0x02000000 : 0x01010000;
+
+            // tfhd
+            const tfhdBox = makeBox('tfhd',
+                u32BE(0x020000),  // flags: default-base-is-moof
+                u32BE(1)          // track_id
+            );
+
+            // tfdt — base media decode time
+            const tfdtBox = makeBox('tfdt',
+                u32BE(0),           // version 0
+                u32BE(_mseDts)      // baseMediaDecodeTime (32-bit for version 0)
+            );
+
+            // trun — 1 sample
+            // flags: data-offset-present | sample-duration-present | sample-size-present | sample-flags-present
+            const trunFlags = 0x000F01;
+            const trunBox = makeBox('trun',
+                u32BE(trunFlags),
+                u32BE(1),               // sample_count
+                u32BE(0),               // data_offset (placeholder, filled below)
+                u32BE(durationTicks),   // sample_duration
+                u32BE(dataSize),        // sample_size
+                u32BE(sampleFlags)      // sample_flags
+            );
+
+            const trafBox = makeBox('traf', tfhdBox, tfdtBox, trunBox);
+            const moofBox = makeBox('moof',
+                makeBox('mfhd', u32BE(0), u32BE(_mseSeqNum++)),
+                trafBox
+            );
+
+            // Patch data_offset in trun: offset from start of moof to start of mdat payload
+            // data_offset = moofBox.length + 8 (mdat header)
+            const dataOffset = moofBox.length + 8;
+            // trun data_offset is at: moof(8) + mfhd(16) + traf(8) + tfhd(?) + tfdt(?) + trun(8) + 4(flags) + 4(count) + 4 = find it
+            // Easier: we know its position in the final moofBox via scanning
+            // The data_offset field is the 3rd u32 inside trun payload (after flags, count)
+            // Let's patch it by locating the trun box inside moofBox
+            // We'll rebuild with correct value instead:
+            // (This is simpler than patching binary)
+            const trunBoxFixed = makeBox('trun',
+                u32BE(trunFlags),
+                u32BE(1),
+                u32BE(dataOffset),
+                u32BE(durationTicks),
+                u32BE(dataSize),
+                u32BE(sampleFlags)
+            );
+            const trafBoxFixed = makeBox('traf', tfhdBox, tfdtBox, trunBoxFixed);
+            const moofBoxFixed = makeBox('moof',
+                makeBox('mfhd', u32BE(0), u32BE(_mseSeqNum - 1)),
+                trafBoxFixed
+            );
+
+            // mdat
+            const mdatBox = new Uint8Array(8 + dataSize);
+            writeUint32BE(mdatBox, 0, mdatBox.length);
+            new TextEncoder().encode('mdat').forEach((b, i) => mdatBox[4+i] = b);
+            mdatBox.set(frameData, 8);
+
+            _mseDts += durationTicks;
+
+            // Concatenate
+            const fragment = new Uint8Array(moofBoxFixed.length + mdatBox.length);
+            fragment.set(moofBoxFixed);
+            fragment.set(mdatBox, moofBoxFixed.length);
+            return fragment;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Main client class
+        // ---------------------------------------------------------------------------
 
         class DistanceClient {
             constructor() {
                 this.canvas = document.getElementById('screen');
                 this.ctx = this.canvas.getContext('2d');
+                this.mseVideo = document.getElementById('mseVideo');
                 this.socket = null;
 
                 this.buffer = new Uint8Array(0);
                 this.frameCount = 0;
                 this.lastStatsTime = Date.now();
                 this.bytesReceived = 0;
+                this.lastFrameSize = 0;
 
-                this.metadata = {
-                    width: 0,
-                    height: 0,
-                    fps: 30,
-                    quality: 75,
-                };
+                this.metadata = { width: 1920, height: 1080, fps: 30, quality: 75 };
+
+                // H.264 decode path
+                this.renderMode = null;      // 'webcodecs' | 'mse' | 'jpeg'
+                this.videoDecoder = null;    // WebCodecs VideoDecoder
+                this.sourceBuffer = null;    // MSE SourceBuffer
+                this.mseQueue = [];          // pending segments for MSE
+                this.mseUpdating = false;
 
                 this.setup();
             }
 
             setup() {
-                // Input handlers (stub for now)
                 document.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-                document.addEventListener('keydown', (e) => this.handleKeyDown(e));
-
+                document.addEventListener('keydown',   (e) => this.handleKeyDown(e));
                 this.connect();
+                this.statsLoop();
             }
 
             connect() {
                 this.socket = new WebSocket('ws://localhost:8080');
                 this.socket.binaryType = 'arraybuffer';
-
-                this.socket.onopen = () => this.onOpen();
+                this.socket.onopen    = () => this.onOpen();
                 this.socket.onmessage = (e) => this.onMessage(e);
-                this.socket.onerror = () => this.onError();
-                this.socket.onclose = () => this.onClose();
+                this.socket.onerror   = () => this.onError();
+                this.socket.onclose   = () => this.onClose();
             }
 
             onOpen() {
@@ -151,7 +452,6 @@
                 const data = new Uint8Array(event.data);
                 this.bytesReceived += data.length;
 
-                // Append to buffer
                 const newBuffer = new Uint8Array(this.buffer.length + data.length);
                 newBuffer.set(this.buffer);
                 newBuffer.set(data, this.buffer.length);
@@ -163,122 +463,346 @@
             processBuffer() {
                 while (this.buffer.length >= 1) {
                     const msgType = this.buffer[0];
+                    const view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
 
+                    // -------------------------------------------------------
+                    // 0x01  METADATA: type(1) + reserved(1) + w(2) + h(2) + fps(4) + quality(4) = 14 bytes
+                    // -------------------------------------------------------
                     if (msgType === MSG_TYPE.METADATA) {
-                        if (this.buffer.length >= 13) {
-                            const view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
-                            this.metadata.width = view.getUint16(1, false);
-                            this.metadata.height = view.getUint16(3, false);
-                            this.metadata.fps = view.getUint32(5, false);
-                            this.metadata.quality = view.getUint32(9, false);
+                        if (this.buffer.length < 14) break;
+                        this.metadata.width   = view.getUint16(2, false);
+                        this.metadata.height  = view.getUint16(4, false);
+                        this.metadata.fps     = view.getUint32(6, false);
+                        this.metadata.quality = view.getUint32(10, false);
+                        console.log('[METADATA]', this.metadata);
+                        document.getElementById('resolution').textContent =
+                            `${this.metadata.width}x${this.metadata.height}`;
+                        this.buffer = this.buffer.slice(14);
+                        continue;
+                    }
 
-                            console.log('[METADATA]', this.metadata);
-                            document.getElementById('resolution').textContent = 
-                                `${this.metadata.width}x${this.metadata.height}`;
-
-                            this.canvas.width = this.metadata.width;
-                            this.canvas.height = this.metadata.height;
-
-                            this.buffer = this.buffer.slice(13);
-                        } else {
-                            break;
+                    // -------------------------------------------------------
+                    // 0x02  JPEG FRAME (legacy mock): type(1) + size(4) + data
+                    // -------------------------------------------------------
+                    if (msgType === MSG_TYPE.FRAME) {
+                        if (this.buffer.length < 5) break;
+                        const frameSize = view.getUint32(1, false);
+                        const totalSize = 5 + frameSize;
+                        if (this.buffer.length < totalSize) break;
+                        const frameData = this.buffer.slice(5, totalSize);
+                        this.buffer = this.buffer.slice(totalSize);
+                        if (this.renderMode === null || this.renderMode === 'jpeg') {
+                            this.renderMode = 'jpeg';
+                            this.renderJpeg(frameData);
                         }
-                    } else if (msgType === MSG_TYPE.FRAME) {
-                        if (this.buffer.length >= 5) {
-                            const view = new DataView(this.buffer.buffer, this.buffer.byteOffset);
-                            const frameSize = view.getUint32(1, false);
-                            const totalSize = 5 + frameSize;
+                        continue;
+                    }
 
-                            if (this.buffer.length >= totalSize) {
-                                const frameData = this.buffer.slice(5, totalSize);
-                                this.buffer = this.buffer.slice(totalSize);
-                                this.renderFrame(frameData);
-                            } else {
-                                break;
+                    // -------------------------------------------------------
+                    // 0x03  VIDEO_INIT: type(1) + w(2) + h(2) + sps_len(4) + sps + pps_len(4) + pps
+                    // -------------------------------------------------------
+                    if (msgType === MSG_TYPE.VIDEO_INIT) {
+                        // Minimum: 1 + 2 + 2 + 4 + 4 = 13 bytes header before we know sps_len
+                        if (this.buffer.length < 13) break;
+                        const w       = view.getUint16(1, false);
+                        const h       = view.getUint16(3, false);
+                        const spsLen  = view.getUint32(5, false);
+                        if (this.buffer.length < 9 + spsLen + 4) break;
+                        const ppsLen  = view.getUint32(9 + spsLen, false);
+                        const totalSize = 13 + spsLen + ppsLen;
+                        if (this.buffer.length < totalSize) break;
+
+                        const sps = this.buffer.slice(9, 9 + spsLen);
+                        const pps = this.buffer.slice(9 + spsLen + 4, 9 + spsLen + 4 + ppsLen);
+                        this.buffer = this.buffer.slice(totalSize);
+
+                        this.initVideoDecoder(w, h, sps, pps);
+                        continue;
+                    }
+
+                    // -------------------------------------------------------
+                    // 0x04  VIDEO_FRAME: type(1) + flags(1) + size(8 uint64 BE) + data
+                    // -------------------------------------------------------
+                    if (msgType === MSG_TYPE.VIDEO_FRAME) {
+                        if (this.buffer.length < 10) break;
+                        const flags = this.buffer[1];
+                        // getBigUint64 returns BigInt; convert to Number (safe for <4GB)
+                        const frameSize = Number(view.getBigUint64(2, false));
+                        const totalSize = 10 + frameSize;
+                        if (this.buffer.length < totalSize) break;
+
+                        const frameData = this.buffer.slice(10, totalSize);
+                        this.buffer = this.buffer.slice(totalSize);
+                        this.lastFrameSize = frameData.length;
+
+                        const isKey = (flags & 0x01) !== 0;
+                        this.decodeVideoFrame(frameData, isKey);
+                        continue;
+                    }
+
+                    // Unknown type — skip 1 byte
+                    console.warn(`[BUFFER] Unknown msg type: 0x${msgType.toString(16)}`);
+                    this.buffer = this.buffer.slice(1);
+                }
+            }
+
+            // -----------------------------------------------------------------------
+            // H.264 decoder init
+            // -----------------------------------------------------------------------
+
+            initVideoDecoder(width, height, sps, pps) {
+                console.log(`[VIDEO] Init ${width}x${height}, SPS=${sps.length}B, PPS=${pps.length}B`);
+
+                this.canvas.width  = width;
+                this.canvas.height = height;
+                document.getElementById('resolution').textContent = `${width}x${height}`;
+
+                // Reset MSE sequence counters when re-initialising
+                _mseSeqNum = 1;
+                _mseDts = 0;
+
+                if (typeof VideoDecoder !== 'undefined') {
+                    this._initWebCodecs(width, height, sps, pps);
+                } else {
+                    this._initMSE(width, height, sps, pps);
+                }
+            }
+
+            _initWebCodecs(width, height, sps, pps) {
+                try {
+                    if (this.videoDecoder) {
+                        try { this.videoDecoder.close(); } catch (_) {}
+                    }
+
+                    const codecStr = codecStringFromSPS(sps);
+                    console.log(`[VIDEO] WebCodecs decoder: ${codecStr}`);
+                    document.getElementById('codecInfo').textContent = `WebCodecs ${codecStr}`;
+
+                    this.videoDecoder = new VideoDecoder({
+                        output: (frame) => {
+                            this.ctx.drawImage(frame, 0, 0);
+                            frame.close();
+                            this.frameCount++;
+                        },
+                        error: (e) => {
+                            console.error('[WEBCODECS] Decoder error:', e);
+                            // Fall back to MSE
+                            this._initMSE(width, height, sps, pps);
+                        }
+                    });
+
+                    const desc = buildAVCDecoderConfig(sps, pps);
+                    this.videoDecoder.configure({
+                        codec:       codecStr,
+                        codedWidth:  width,
+                        codedHeight: height,
+                        description: desc,
+                        hardwareAcceleration: 'prefer-hardware',
+                        optimizeForLatency: true,
+                    });
+
+                    this.renderMode = 'webcodecs';
+                } catch (e) {
+                    console.error('[WEBCODECS] Init failed:', e, '— falling back to MSE');
+                    this._initMSE(width, height, sps, pps);
+                }
+            }
+
+            _initMSE(width, height, sps, pps) {
+                try {
+                    const codecStr = codecStringFromSPS(sps);
+                    const mime = `video/mp4; codecs="${codecStr}"`;
+                    console.log(`[VIDEO] MSE path: ${mime}`);
+                    document.getElementById('codecInfo').textContent = `MSE ${codecStr}`;
+
+                    if (!MediaSource.isTypeSupported(mime)) {
+                        console.error('[MSE] Codec not supported:', mime);
+                        return;
+                    }
+
+                    // Wire MSE video element → canvas via requestAnimationFrame
+                    const ms = new MediaSource();
+                    this.mseVideo.src = URL.createObjectURL(ms);
+
+                    ms.addEventListener('sourceopen', () => {
+                        this.sourceBuffer = ms.addSourceBuffer(mime);
+                        this.sourceBuffer.mode = 'segments';
+
+                        this.sourceBuffer.addEventListener('updateend', () => {
+                            this.mseUpdating = false;
+                            this._flushMSEQueue();
+                        });
+                        this.sourceBuffer.addEventListener('error', (e) => {
+                            console.error('[MSE] SourceBuffer error:', e);
+                        });
+
+                        // Write init segment (ftyp + moov)
+                        const ftyp = buildFtypBox();
+                        const moov = buildMoovBox(width, height, sps, pps);
+                        const init = new Uint8Array(ftyp.length + moov.length);
+                        init.set(ftyp);
+                        init.set(moov, ftyp.length);
+                        this._appendMSE(init);
+                    }, { once: true });
+
+                    // Draw MSE video to canvas
+                    this.mseVideo.style.display = 'none';
+                    this._drawMSEVideo();
+
+                    this.renderMode = 'mse';
+                } catch (e) {
+                    console.error('[MSE] Init failed:', e);
+                }
+            }
+
+            _drawMSEVideo() {
+                if (this.renderMode !== 'mse') return;
+                if (!this.mseVideo.paused && this.mseVideo.readyState >= 2) {
+                    this.ctx.drawImage(this.mseVideo, 0, 0);
+                    this.frameCount++;
+                }
+                requestAnimationFrame(() => this._drawMSEVideo());
+            }
+
+            _appendMSE(data) {
+                this.mseQueue.push(data);
+                this._flushMSEQueue();
+            }
+
+            _flushMSEQueue() {
+                if (!this.sourceBuffer || this.mseUpdating || this.mseQueue.length === 0) return;
+                const segment = this.mseQueue.shift();
+                this.mseUpdating = true;
+                try {
+                    this.sourceBuffer.appendBuffer(segment);
+                } catch (e) {
+                    console.error('[MSE] appendBuffer failed:', e);
+                    this.mseUpdating = false;
+                }
+            }
+
+            // -----------------------------------------------------------------------
+            // Per-frame decode
+            // -----------------------------------------------------------------------
+
+            decodeVideoFrame(frameData, isKey) {
+                if (this.renderMode === 'webcodecs' && this.videoDecoder) {
+                    try {
+                        const chunk = new EncodedVideoChunk({
+                            type:      isKey ? 'key' : 'delta',
+                            timestamp: performance.now() * 1000,  // microseconds
+                            data:      frameData,
+                        });
+                        this.videoDecoder.decode(chunk);
+                    } catch (e) {
+                        console.error('[WEBCODECS] decode error:', e);
+                    }
+                } else if (this.renderMode === 'mse' && this.sourceBuffer) {
+                    // 30fps → 3000 ticks at 90kHz
+                    const durationTicks = Math.round(90000 / (this.metadata.fps || 30));
+                    const fragment = buildFragmentBoxes(frameData, isKey, durationTicks);
+                    this._appendMSE(fragment);
+
+                    // Trim buffer to avoid unbounded growth (keep last 2s)
+                    if (this.sourceBuffer && !this.sourceBuffer.updating) {
+                        const buffered = this.sourceBuffer.buffered;
+                        if (buffered.length > 0) {
+                            const end = buffered.end(buffered.length - 1);
+                            const trimTo = end - 2.0;
+                            if (trimTo > buffered.start(0) + 0.5) {
+                                try { this.sourceBuffer.remove(0, trimTo); } catch (_) {}
                             }
-                        } else {
-                            break;
                         }
-                    } else {
-                        console.warn(`[BUFFER] Unknown type: 0x${msgType.toString(16)}`);
-                        this.buffer = this.buffer.slice(1);
                     }
                 }
             }
 
-            renderFrame(frameData) {
-                try {
-                    const blob = new Blob([frameData], { type: 'image/jpeg' });
-                    const url = URL.createObjectURL(blob);
-                    const img = new Image();
+            // -----------------------------------------------------------------------
+            // Legacy JPEG render
+            // -----------------------------------------------------------------------
 
-                    img.onload = () => {
-                        this.ctx.drawImage(img, 0, 0);
-                        URL.revokeObjectURL(url);
-
-                        this.frameCount++;
-                        const now = Date.now();
-                        const elapsed = (now - this.lastStatsTime) / 1000;
-
-                        if (elapsed >= 1.0) {
-                            const fps = Math.round(this.frameCount / elapsed);
-                            const mbps = (this.bytesReceived * 8) / (elapsed * 1_000_000);
-
-                            document.getElementById('fps').textContent = fps;
-                            document.getElementById('frameSize').textContent = 
-                                (frameData.length / 1024).toFixed(1);
-                            document.getElementById('networkStats').textContent = mbps.toFixed(2);
-
-                            this.frameCount = 0;
-                            this.bytesReceived = 0;
-                            this.lastStatsTime = now;
-                        }
-                    };
-
-                    img.onerror = () => {
-                        console.error('[FRAME] Invalid JPEG');
-                        URL.revokeObjectURL(url);
-                    };
-
-                    img.src = url;
-                } catch (e) {
-                    console.error('[RENDER]', e);
-                }
+            renderJpeg(frameData) {
+                const blob = new Blob([frameData], { type: 'image/jpeg' });
+                const url = URL.createObjectURL(blob);
+                const img = new Image();
+                img.onload = () => {
+                    if (this.canvas.width !== img.width || this.canvas.height !== img.height) {
+                        this.canvas.width  = img.width;
+                        this.canvas.height = img.height;
+                    }
+                    this.ctx.drawImage(img, 0, 0);
+                    URL.revokeObjectURL(url);
+                    this.frameCount++;
+                };
+                img.onerror = () => {
+                    console.error('[JPEG] Invalid frame');
+                    URL.revokeObjectURL(url);
+                };
+                img.src = url;
             }
+
+            // -----------------------------------------------------------------------
+            // Stats loop
+            // -----------------------------------------------------------------------
+
+            statsLoop() {
+                setInterval(() => {
+                    const now  = Date.now();
+                    const elapsed = (now - this.lastStatsTime) / 1000;
+                    if (elapsed < 0.5) return;
+
+                    const fps  = Math.round(this.frameCount / elapsed);
+                    const mbps = (this.bytesReceived * 8) / (elapsed * 1_000_000);
+
+                    document.getElementById('fps').textContent = fps;
+                    document.getElementById('frameSize').textContent =
+                        (this.lastFrameSize / 1024).toFixed(1);
+                    document.getElementById('networkStats').textContent = mbps.toFixed(2);
+
+                    this.frameCount    = 0;
+                    this.bytesReceived = 0;
+                    this.lastStatsTime = now;
+                }, 1000);
+            }
+
+            // -----------------------------------------------------------------------
+            // Input stubs
+            // -----------------------------------------------------------------------
 
             handleMouseMove(e) {
                 if (this.socket?.readyState !== WebSocket.OPEN) return;
-                // TODO: Send mouse position to agent
+                // TODO: send mouse position
             }
 
             handleKeyDown(e) {
                 if (this.socket?.readyState !== WebSocket.OPEN) return;
-                // TODO: Send key event to agent
+                // TODO: send key event
             }
 
             sendSettings(quality, width = null, height = null) {
                 if (this.socket?.readyState !== WebSocket.OPEN) return;
-
                 let flags = 0;
                 let msg;
-
                 if (width && height) {
-                    flags |= 0x01;  // Resolution change flag
+                    flags |= 0x01;
                     msg = new Uint8Array(8);
                     msg[0] = MSG_TYPE.SETTINGS;
                     new DataView(msg.buffer).setUint16(1, quality, false);
                     msg[3] = flags;
-                    new DataView(msg.buffer).setUint16(4, width, false);
-                    new DataView(msg.buffer).setUint16(6, height, false);
+                    new DataView(msg.buffer).setUint16(4, width,   false);
+                    new DataView(msg.buffer).setUint16(6, height,  false);
                 } else {
                     msg = new Uint8Array(4);
                     msg[0] = MSG_TYPE.SETTINGS;
                     new DataView(msg.buffer).setUint16(1, quality, false);
                     msg[3] = flags;
                 }
-
                 this.socket.send(msg);
             }
+
+            // -----------------------------------------------------------------------
+            // Connection events
+            // -----------------------------------------------------------------------
 
             onError() {
                 this.updateStatus('Error', 'error');
@@ -288,6 +812,12 @@
             onClose() {
                 this.updateStatus('Disconnected', 'error');
                 console.log('[CLIENT] Disconnected');
+                // Close WebCodecs decoder cleanly
+                if (this.videoDecoder) {
+                    try { this.videoDecoder.close(); } catch (_) {}
+                    this.videoDecoder = null;
+                }
+                this.renderMode = null;
                 setTimeout(() => this.connect(), 2000);
             }
 
