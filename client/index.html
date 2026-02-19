@@ -76,7 +76,7 @@
         <canvas id="screen"></canvas>
     </div>
 
-    <!-- Hidden video element used by MSE path -->
+    <!-- Hidden video element used by the MSE/Firefox decode path -->
     <video id="mseVideo" style="display:none" autoplay muted playsinline></video>
 
     <div id="status">
@@ -106,7 +106,6 @@
     <script>
         const MSG_TYPE = {
             METADATA:    0x01,
-            FRAME:       0x02,  // legacy JPEG mock
             VIDEO_INIT:  0x03,  // H.264 init (SPS/PPS)
             VIDEO_FRAME: 0x04,  // H.264 frame (Annex B)
             SETTINGS:    0x10,
@@ -418,7 +417,7 @@
                 this.metadata = { width: 1920, height: 1080, fps: 30, quality: 75 };
 
                 // H.264 decode path
-                this.renderMode = null;      // 'webcodecs' | 'mse' | 'jpeg'
+                this.renderMode = null;      // 'webcodecs' | 'mse'
                 this.videoDecoder = null;    // WebCodecs VideoDecoder
                 this.sourceBuffer = null;    // MSE SourceBuffer
                 this.mseQueue = [];          // pending segments for MSE
@@ -478,23 +477,6 @@
                         document.getElementById('resolution').textContent =
                             `${this.metadata.width}x${this.metadata.height}`;
                         this.buffer = this.buffer.slice(14);
-                        continue;
-                    }
-
-                    // -------------------------------------------------------
-                    // 0x02  JPEG FRAME (legacy mock): type(1) + size(4) + data
-                    // -------------------------------------------------------
-                    if (msgType === MSG_TYPE.FRAME) {
-                        if (this.buffer.length < 5) break;
-                        const frameSize = view.getUint32(1, false);
-                        const totalSize = 5 + frameSize;
-                        if (this.buffer.length < totalSize) break;
-                        const frameData = this.buffer.slice(5, totalSize);
-                        this.buffer = this.buffer.slice(totalSize);
-                        if (this.renderMode === null || this.renderMode === 'jpeg') {
-                            this.renderMode = 'jpeg';
-                            this.renderJpeg(frameData);
-                        }
                         continue;
                     }
 
@@ -715,30 +697,6 @@
                         }
                     }
                 }
-            }
-
-            // -----------------------------------------------------------------------
-            // Legacy JPEG render
-            // -----------------------------------------------------------------------
-
-            renderJpeg(frameData) {
-                const blob = new Blob([frameData], { type: 'image/jpeg' });
-                const url = URL.createObjectURL(blob);
-                const img = new Image();
-                img.onload = () => {
-                    if (this.canvas.width !== img.width || this.canvas.height !== img.height) {
-                        this.canvas.width  = img.width;
-                        this.canvas.height = img.height;
-                    }
-                    this.ctx.drawImage(img, 0, 0);
-                    URL.revokeObjectURL(url);
-                    this.frameCount++;
-                };
-                img.onerror = () => {
-                    console.error('[JPEG] Invalid frame');
-                    URL.revokeObjectURL(url);
-                };
-                img.src = url;
             }
 
             // -----------------------------------------------------------------------

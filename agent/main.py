@@ -2,57 +2,13 @@ import asyncio
 import websockets
 import struct
 import time
-import base64
 import subprocess
 import shutil
 import sys
 import threading
+import re
 from dataclasses import dataclass
 from typing import Optional, Set
-
-# ---------------------------------------------------------------------------
-# Mock frame (320x240 red-to-blue gradient JPEG) — used when ffmpeg isn't up
-# ---------------------------------------------------------------------------
-_MOCK_JPEG_B64 = (
-    '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'
-)
-_MOCK_JPEG = base64.b64decode(_MOCK_JPEG_B64)
-
-def generate_test_frame() -> bytes:
-    return _MOCK_JPEG
 
 
 # ---------------------------------------------------------------------------
@@ -194,17 +150,65 @@ def parse_sps_dimensions(sps: bytes) -> tuple[int, int]:
 # FFmpegReader: spawns ffmpeg, parses Annex B stdout into frame packets
 # ---------------------------------------------------------------------------
 
+def _get_screen_device_index() -> int:
+    """
+    Detect the screen capture device index on macOS.
+    Lists AVFoundation devices, parses output, and returns the index of 'Capture screen 0'.
+    Falls back to index 1 if detection fails.
+    """
+    try:
+        ffmpeg = shutil.which('ffmpeg') or '/usr/local/bin/ffmpeg'
+        result = subprocess.run(
+            [ffmpeg, '-f', 'avfoundation', '-list_devices', 'true', '-i', ''],
+            capture_output=True,
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=5
+        )
+
+        output = result.stdout
+        video_devices = {}
+        capture_video = False
+
+        # Parse video devices section
+        for line in output.splitlines():
+            if "AVFoundation video devices:" in line:
+                capture_video = True
+                continue
+            if "AVFoundation audio devices:" in line:
+                capture_video = False
+                continue
+            if capture_video:
+                match = re.search(r"\[(\d+)\]\s(.+)", line)
+                if match:
+                    idx, name = match.groups()
+                    video_devices[name.strip()] = int(idx)
+
+        # Find screen capture device
+        for name, idx in video_devices.items():
+            if "Capture screen" in name:
+                print(f"[FFMPEG] Found screen device: '{name}' at index {idx}")
+                return idx
+
+        print("[FFMPEG] No screen capture device found, falling back to index 1")
+        return 1
+    except Exception as e:
+        print(f"[FFMPEG] Device detection failed: {e}, falling back to index 1")
+        return 1
+
+
 def _build_ffmpeg_cmd() -> list[str]:
     ffmpeg = shutil.which('ffmpeg') or '/usr/local/bin/ffmpeg'
     common = ['-profile:v', 'baseline', '-level:v', '3.1', '-f', 'h264', 'pipe:1']
 
     if sys.platform == 'darwin':
+        screen_idx = _get_screen_device_index()
         return [
             ffmpeg,
             '-f', 'avfoundation',
             '-capture_cursor', '1',
             '-framerate', '30',
-            '-i', '1',                      # display index 1 in avfoundation list
+            '-i', f'{screen_idx}:0',        # auto-detected screen index + default audio
             '-c:v', 'h264_videotoolbox',
             '-realtime', '1',
             '-b:v', '8M',
@@ -242,12 +246,13 @@ def _build_ffmpeg_sw_cmd() -> list[str]:
     common = ['-profile:v', 'baseline', '-level:v', '3.1', '-f', 'h264', 'pipe:1']
 
     if sys.platform == 'darwin':
+        screen_idx = _get_screen_device_index()
         return [
             ffmpeg,
             '-f', 'avfoundation',
             '-capture_cursor', '1',
             '-framerate', '30',
-            '-i', '1',
+            '-i', f'{screen_idx}:0',        # auto-detected screen index + default audio
             '-c:v', 'libx264',
             '-tune', 'zerolatency',
             '-preset', 'superfast',
@@ -459,14 +464,10 @@ class DistanceAgent:
         self.total_bytes = 0
 
         # H.264 state
-        self._h264_init_msg: Optional[bytes] = None  # cached VIDEO_INIT message
-        self._h264_ready = threading.Event()          # set when init is sent
-
-        # Latest H.264 frame (set from ffmpeg thread, read from async loop)
+        self._h264_init_msg: Optional[bytes] = None  # cached VIDEO_INIT for late-joining clients
         self._latest_h264: Optional[bytes] = None
         self._latest_is_key: bool = False
         self._h264_lock = threading.Lock()
-        self._h264_new = threading.Event()  # signalled when a new frame arrives
 
     # ------------------------------------------------------------------
     # WebSocket connection handler
@@ -539,12 +540,6 @@ class DistanceAgent:
             self.total_bytes = 0
             self.last_stats_time = now
 
-    async def broadcast_jpeg_frame(self, frame_data: bytes):
-        """Legacy JPEG broadcast (mock fallback)."""
-        msg = struct.pack('!BI', 0x02, len(frame_data)) + frame_data
-        await self._broadcast(msg)
-        self.frame_count += 1
-
     # ------------------------------------------------------------------
     # Input handling (stubs)
     # ------------------------------------------------------------------
@@ -586,11 +581,8 @@ class DistanceAgent:
         reader.set_callbacks(self._on_h264_init, self._on_h264_frame)
         reader.start()
 
-        frame_interval = 1.0 / self.config.fps
-
         while True:
             try:
-                # Check for a new H.264 frame (non-blocking)
                 with self._h264_lock:
                     h264_data = self._latest_h264
                     is_key = self._latest_is_key
@@ -598,11 +590,8 @@ class DistanceAgent:
 
                 if h264_data is not None:
                     await self.broadcast_h264_frame(h264_data, is_key)
-                elif not reader.running or self._h264_init_msg is None:
-                    # ffmpeg not yet up — send mock JPEG
-                    await self.broadcast_jpeg_frame(generate_test_frame())
-
-                await asyncio.sleep(frame_interval)
+                else:
+                    await asyncio.sleep(0.001)
 
             except Exception as e:
                 print(f"[ERROR] Stream loop: {e}")
