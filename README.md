@@ -1,2 +1,2 @@
-# distance
-Remote desktop for speed masochists.
+# MOVED.
+Drop by https://github.com/distancedesktop.
